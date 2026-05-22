@@ -1,11 +1,11 @@
 import nodemailer from "nodemailer";
-import { detectEmailProvider } from "../../lib/email-compose.js";
+import { detectEmailProvider } from "../lib/email-compose.js";
 import {
   normalizeAppPassword,
   normalizeSmtpUser,
   validateSmtpUserForProvider,
   formatSmtpError,
-} from "../../lib/smtp-auth.js";
+} from "../lib/smtp-auth.js";
 
 function oauthConfigured(smtp) {
   return !!(

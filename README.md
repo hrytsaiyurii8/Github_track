@@ -20,7 +20,7 @@ npm start
 
 ## Online deployment
 
-Deploy this folder to any Node host (Railway, Render, VPS, etc.). Set the same environment variables in the host dashboard. Point the extension API URL to your public base URL (e.g. `https://your-app.example.com`).
+Deploy the **`server/` directory** as the app root (it includes `lib/` for shared helpers — do not deploy only `src/`). Set the same environment variables in the host dashboard. Point the extension API URL to your public base URL (e.g. `https://your-app.example.com`).
 
 ## Archive upload
 

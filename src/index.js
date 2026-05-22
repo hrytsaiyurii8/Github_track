@@ -3,7 +3,7 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import { getLocalIPv4, buildApiUrl } from "./network.js";
-import { deriveContactIp, normalizeArchiveIp } from "../../lib/archive-ip.js";
+import { deriveContactIp, normalizeArchiveIp } from "../lib/archive-ip.js";
 import {
   sendContactEmail,
   resolveProviderForAddress,

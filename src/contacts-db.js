@@ -1,4 +1,4 @@
-import { deriveContactIp } from "../../lib/archive-ip.js";
+import { deriveContactIp } from "../lib/archive-ip.js";
 import { getSupabase } from "./supabase.js";
 
 export function rowToDoc(row) {
