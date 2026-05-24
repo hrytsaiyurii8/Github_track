@@ -6,6 +6,11 @@ import {
   validateSmtpUserForProvider,
   formatSmtpError,
 } from "../lib/smtp-auth.js";
+import {
+  sanitizeEmailBody,
+  textToSimpleHtml,
+  formatFromHeader,
+} from "../../lib/email-deliverability.js";
 
 function oauthConfigured(smtp) {
   return !!(
@@ -108,14 +113,34 @@ function createTransport(provider, smtp = {}) {
   return createGmailTransport(smtp);
 }
 
-export async function sendContactEmail({ to, subject, body, provider, smtp }) {
+export async function sendContactEmail({
+  to,
+  subject,
+  body,
+  provider,
+  smtp,
+  fromName,
+}) {
   try {
     const { transport, from } = createTransport(provider, smtp);
+    const text = sanitizeEmailBody(body);
+    const html = textToSimpleHtml(text);
+    const senderLabel =
+      fromName?.trim() ||
+      smtp?.gmail?.user?.split("@")[0] ||
+      smtp?.outlook?.user?.split("@")[0] ||
+      from.split("@")[0];
+
     const info = await transport.sendMail({
-      from,
+      from: formatFromHeader(from, senderLabel),
       to: String(to).trim(),
-      subject: subject || "(no subject)",
-      text: body || "",
+      replyTo: from,
+      subject: (subject || "Following up").trim(),
+      text,
+      html,
+      headers: {
+        "X-Priority": "3",
+      },
     });
     return { messageId: info.messageId, provider, from };
   } catch (err) {

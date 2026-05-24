@@ -1,4 +1,8 @@
 import { deriveContactIp } from "../lib/archive-ip.js";
+import {
+  assertContactSaveAllowed,
+  assertEmailsAvailable,
+} from "./email-claims.js";
 import { getSupabase } from "./supabase.js";
 
 export function rowToDoc(row) {
@@ -105,16 +109,31 @@ export async function listContacts(ownerIp, limit = 500) {
 
   if (ownerIp) {
     query = query.or(
-      `owner_ip.eq.${ownerIp},and(owner_ip.eq.,saved_ip.eq.${ownerIp})`
+      `owner_ip.eq.${ownerIp},and(owner_ip.eq."",saved_ip.eq.${ownerIp})`
     );
   }
 
-  const { data, error } = await query;
-  if (error) throw error;
+  let { data, error } = await query;
+  if (error && ownerIp) {
+    const fallback = await supabase
+      .from("contacts")
+      .select("*")
+      .order("added_at", { ascending: false })
+      .limit(limit);
+    if (fallback.error) throw fallback.error;
+    data = (fallback.data || []).filter(
+      (row) =>
+        row.owner_ip === ownerIp ||
+        ((!row.owner_ip || row.owner_ip === "") && row.saved_ip === ownerIp)
+    );
+  } else if (error) {
+    throw error;
+  }
   return (data || []).map(rowToDoc);
 }
 
 export async function upsertContact(body, ownerIp) {
+  await assertContactSaveAllowed(body, ownerIp);
   const existing = await getContactByLogin(body.githubLogin);
   const row = payloadToRow(body, ownerIp, existing);
   const supabase = getSupabase();
@@ -132,6 +151,8 @@ export async function upsertContact(body, ownerIp) {
 export async function updateContactEmails(login, allEmails, ownerIp) {
   const existing = await getContactForOwner(login, ownerIp);
   if (!existing) return null;
+
+  await assertEmailsAvailable(allEmails, { excludeGithubLogin: login });
 
   const gmail = allEmails.find((e) => /@(gmail\.com|googlemail\.com)$/i.test(e));
   const primary = gmail || allEmails[0];
@@ -153,17 +174,24 @@ export async function updateContactEmails(login, allEmails, ownerIp) {
   return rowToDoc(data);
 }
 
-export async function incrementSentAndUpdate(login, outreachStatus) {
+export async function incrementSentAndUpdate(login, outreachStatus, ownerIp = "") {
   const existing = await getContactByLogin(login);
   if (!existing) return null;
 
   const supabase = getSupabase();
   const now = new Date().toISOString();
+  const wasSent =
+    existing.outreach_status === "sent" || existing.outreach_status === "read";
   const patch = {
     outreach_status: outreachStatus,
     updated_at: now,
-    emails_sent_count: (existing.emails_sent_count || 0) + 1,
   };
+  if (outreachStatus === "sent" && !wasSent) {
+    patch.emails_sent_count = (existing.emails_sent_count || 0) + 1;
+  }
+  if (ownerIp && !existing.owner_ip) {
+    patch.owner_ip = ownerIp;
+  }
 
   const { data, error } = await supabase
     .from("contacts")
@@ -184,7 +212,11 @@ export async function patchOutreach(login, status) {
   const now = new Date().toISOString();
   const patch = { outreach_status: status, updated_at: now };
 
-  if (status === "sent") {
+  if (
+    status === "sent" &&
+    existing.outreach_status !== "sent" &&
+    existing.outreach_status !== "read"
+  ) {
     patch.emails_sent_count = (existing.emails_sent_count || 0) + 1;
   }
   if (status === "read") {

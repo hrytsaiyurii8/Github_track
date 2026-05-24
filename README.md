@@ -6,7 +6,7 @@ The API stores contacts in **Supabase PostgreSQL** and profile photos in **Supab
 
 1. Create a project at [supabase.com](https://supabase.com).
 2. In **SQL Editor**, run the script: `supabase/schema.sql`.
-3. In **Storage**, create a public bucket named `avatars` (or set `SUPABASE_AVATAR_BUCKET` in `.env`).
+3. In **Storage**, the server auto-creates a public bucket named `avatars` on startup (or set `SUPABASE_AVATAR_BUCKET` in `.env`). You can also create it manually in the dashboard.
 4. Copy `.env.example` to `.env` and fill in:
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY` (Project Settings → API)

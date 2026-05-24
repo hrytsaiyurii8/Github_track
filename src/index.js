@@ -2,7 +2,11 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import { getLocalIPv4, buildApiUrl } from "./network.js";
+import {
+  resolveServerLanHost,
+  resolvePublicApiUrl,
+  listLanIPv4s,
+} from "./network.js";
 import { deriveContactIp, normalizeArchiveIp } from "../lib/archive-ip.js";
 import {
   sendContactEmail,
@@ -10,8 +14,8 @@ import {
   verifySmtpLogin,
   normalizeSmtpBody,
 } from "./mail.js";
-import { checkSupabase } from "./supabase.js";
-import { uploadAvatarFile } from "./avatar-storage.js";
+import { ensureAvatarBucket, uploadAvatarFile } from "./avatar-storage.js";
+import { getAvatarBucket } from "./supabase.js";
 import {
   upsertContact,
   listContacts,
@@ -22,11 +26,23 @@ import {
   patchOutreach,
   rowToDoc,
 } from "./contacts-db.js";
+import { getOperatorProfile, upsertOperatorProfile } from "./operator-db.js";
+import {
+  insertSaemadangEvent,
+  listSaemadangEvents,
+  listSaemadangDays,
+} from "./activity-db.js";
+import { getCachedHealthStatus, refreshHealthStatus } from "./health-status.js";
+import {
+  buildContactRegistry,
+  claimErrorResponse,
+} from "./email-claims.js";
 
+const API_BUILD = "1.7.6";
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
-const LOCAL_IP = process.env.PUBLIC_HOST || getLocalIPv4();
-const API_URL = buildApiUrl(LOCAL_IP, PORT);
+const LOCAL_IP = resolveServerLanHost();
+const API_URL = resolvePublicApiUrl(LOCAL_IP, PORT);
 
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
@@ -38,14 +54,16 @@ const avatarUpload = multer({
 });
 
 const app = express();
+app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS) || 1);
 
 app.use(
   cors({
     origin: true,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+app.options("*", cors());
 app.use(express.json({ limit: "256kb" }));
 
 app.use((err, req, res, next) => {
@@ -58,19 +76,48 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-app.get("/health", async (_req, res) => {
+/** Fast ping for extension connectivity (no database round-trips). */
+app.get("/health/ping", (_req, res) => {
+  res.json({ ok: true, build: API_BUILD, apiUrl: API_URL });
+});
+
+/** All emails already saved (for UI duplicate checks). */
+app.get("/api/emails/claims", async (req, res) => {
+  try {
+    const { claims, loginOwners } = await buildContactRegistry();
+    res.json({
+      claims,
+      loginOwners,
+      myOwnerIp: getClientIp(req) || "",
+    });
+  } catch (err) {
+    console.error("GET /api/emails/claims", err);
+    res.status(500).json({ error: err.message || "Failed to load email claims" });
+  }
+});
+
+app.get("/health", (_req, res) => {
   const oauthReady = !!(
     process.env.GOOGLE_CLIENT_ID?.trim() &&
     process.env.GOOGLE_CLIENT_SECRET?.trim()
   );
-  const supabase = await checkSupabase();
+  const { supabase, schema } = getCachedHealthStatus();
   res.json({
-    ok: supabase.ok,
+    ok: true,
+    build: API_BUILD,
     database: "supabase",
     supabase: supabase.ok,
     supabaseError: supabase.error || null,
+    schemaOk: schema.ok,
+    schemaMissing: schema.missing || [],
+    features: {
+      saemadang: schema.ok || !schema.missing?.includes("saemadang_events"),
+      operatorArchive:
+        schema.ok || !schema.missing?.includes("operator_profiles"),
+    },
     apiUrl: API_URL,
     host: LOCAL_IP,
+    lanAddresses: listLanIPv4s(),
     clientIp: getClientIp(_req) || LOCAL_IP,
     port: PORT,
     automatic: true,
@@ -153,6 +200,115 @@ app.get("/api/client-ip", (req, res) => {
   });
 });
 
+/** Operator configuration archive (per owner IP + email addresses) */
+app.get("/api/operator/profile", async (req, res) => {
+  try {
+    const ownerIp =
+      normalizeArchiveIp(String(req.query.ownerIp || "")) || getClientIp(req);
+    if (!ownerIp) {
+      return res.status(400).json({ error: "Could not determine operator IP" });
+    }
+    const profile = await getOperatorProfile(ownerIp);
+    res.json({ ok: true, ownerIp, profile });
+  } catch (err) {
+    console.error("GET /api/operator/profile", err);
+    res.status(500).json({ error: err.message || "Failed to load profile" });
+  }
+});
+
+app.put("/api/operator/profile", async (req, res) => {
+  try {
+    const ownerIp = getClientIp(req) || "";
+    if (!ownerIp) {
+      return res.status(400).json({ error: "Could not determine operator IP" });
+    }
+    const existing = await getOperatorProfile(ownerIp);
+    const profile = await upsertOperatorProfile(ownerIp, {
+      operatorLabel: req.body?.operatorLabel,
+      apiUrl: req.body?.apiUrl,
+      apiUrlAuto: req.body?.apiUrlAuto,
+      githubToken: req.body?.githubToken,
+      gmailUser: req.body?.gmailUser,
+      gmailEnabled: req.body?.gmailEnabled,
+      gmailAuthMethod: req.body?.gmailAuthMethod,
+      outlookUser: req.body?.outlookUser,
+      outlookEnabled: req.body?.outlookEnabled,
+      secrets: req.body?.secrets || {},
+      existingSecrets: existing?.secrets,
+    });
+    await recordActivity(req, "config_saved", "Configuration archived to database", {
+      apiUrl: profile.apiUrl,
+      gmailUser: profile.gmailUser,
+      outlookUser: profile.outlookUser,
+    });
+    res.json({ ok: true, ownerIp, profile });
+  } catch (err) {
+    console.error("PUT /api/operator/profile", err);
+    res.status(500).json({ error: err.message || "Failed to save profile" });
+  }
+});
+
+/** Saemadang — daily activity log */
+async function handlePostSaemadangLog(req, res) {
+  try {
+    const ownerIp = getClientIp(req) || "";
+    if (!ownerIp) {
+      return res.status(400).json({ error: "Could not determine operator IP" });
+    }
+    const action = String(req.body?.action || "").trim();
+    if (!action) {
+      return res.status(400).json({ error: "action is required" });
+    }
+    const event = await insertSaemadangEvent({
+      ownerIp,
+      action,
+      summary: req.body?.summary || action,
+      detail: req.body?.detail || {},
+      contactLogin: req.body?.contactLogin || req.body?.contact_login,
+      emailAddress: req.body?.emailAddress || req.body?.email,
+      activityDate: req.body?.activityDate || null,
+    });
+    res.status(201).json({ ok: true, event });
+  } catch (err) {
+    console.error("POST saemadang/log", err);
+    const status = err.code === "SCHEMA_MISSING" ? 503 : 500;
+    res.status(status).json({ error: err.message || "Failed to log activity" });
+  }
+}
+
+app.post("/api/saemadang/log", handlePostSaemadangLog);
+app.post("/api/activity/log", handlePostSaemadangLog);
+
+async function handleGetSaemadang(req, res) {
+  try {
+    const ownerIp =
+      normalizeArchiveIp(String(req.query.ownerIp || "")) || getClientIp(req);
+    if (!ownerIp) {
+      return res.status(400).json({ error: "Could not determine operator IP" });
+    }
+    const activityDate = String(req.query.date || "").slice(0, 10) || undefined;
+    const events = await listSaemadangEvents(ownerIp, {
+      activityDate,
+      limit: req.query.limit,
+    });
+    const days = await listSaemadangDays(ownerIp, 60);
+    res.json({
+      ok: true,
+      ownerIp,
+      activityDate: activityDate || new Date().toISOString().slice(0, 10),
+      events,
+      days,
+    });
+  } catch (err) {
+    console.error("GET saemadang", err);
+    const status = err.code === "SCHEMA_MISSING" ? 503 : 500;
+    res.status(status).json({ error: err.message || "Failed to load activities" });
+  }
+}
+
+app.get("/api/saemadang", handleGetSaemadang);
+app.get("/api/activity/daily", handleGetSaemadang);
+
 /** Save archive entry with optional avatar file upload (multipart) */
 app.post("/api/archive/save", avatarUpload.single("avatar"), async (req, res) => {
   try {
@@ -169,19 +325,34 @@ app.post("/api/archive/save", avatarUpload.single("avatar"), async (req, res) =>
 
     const ownerIp = getClientIp(req) || "";
     if (req.file) {
-      body.avatarUrl = await uploadAvatarFile(req.file, body.githubLogin);
+      try {
+        body.avatarUrl = await uploadAvatarFile(req.file, body.githubLogin);
+      } catch (uploadErr) {
+        console.error("Avatar upload:", uploadErr.message);
+        body.avatarUrl = `https://www.gravatar.com/avatar?d=identicon&s=128&email=${encodeURIComponent(body.email)}`;
+      }
     } else if (!body.avatarUrl) {
       const existing = await getContactByLogin(body.githubLogin);
       if (existing?.avatar_url) body.avatarUrl = existing.avatar_url;
     }
 
     const { doc, created } = await upsertContact(body, ownerIp);
+    await recordActivity(
+      req,
+      created ? "archive_created" : "archive_updated",
+      `${created ? "Added" : "Updated"} archive: ${body.name} (${body.email})`,
+      {
+        contactLogin: body.githubLogin,
+        emailAddress: body.email,
+      }
+    );
     res.status(created ? 201 : 200).json({
       ok: true,
       created,
       contact: toPublic(doc),
     });
   } catch (err) {
+    if (claimErrorResponse(err, res)) return;
     console.error("POST /api/archive/save", err);
     res.status(500).json({ error: err.message || "Failed to save archive entry" });
   }
@@ -197,13 +368,20 @@ app.post("/api/contacts", async (req, res) => {
 
     const ownerIp = getClientIp(req) || "";
     const { doc, created } = await upsertContact(body, ownerIp);
+    await recordActivity(
+      req,
+      created ? "contact_added" : "contact_updated",
+      `${created ? "Added" : "Updated"} contact @${body.githubLogin}`,
+      { contactLogin: body.githubLogin, emailAddress: body.email }
+    );
 
-    res.status(201).json({
+    res.status(created ? 201 : 200).json({
       ok: true,
       created,
       contact: toPublic(doc),
     });
   } catch (err) {
+    if (claimErrorResponse(err, res)) return;
     console.error("POST /api/contacts", err);
     res.status(500).json({ error: err.message || "Failed to save contact" });
   }
@@ -240,10 +418,13 @@ app.post("/api/send-email", async (req, res) => {
     if (!to) return res.status(400).json({ error: "Recipient email is required" });
 
     const ownerIp = getClientIp(req) || "";
-    const contact = await getContactForOwner(login, ownerIp);
+    let contact = await getContactForOwner(login, ownerIp);
+    if (!contact) {
+      contact = await getContactByLogin(login);
+    }
     if (!contact) {
       return res.status(404).json({
-        error: "Contact not found for your IP. Re-add from Browse on this machine.",
+        error: "Contact not in archive. Add to My List first.",
       });
     }
 
@@ -270,8 +451,20 @@ app.post("/api/send-email", async (req, res) => {
       });
     }
 
-    await sendContactEmail({ to, subject, body, provider, smtp });
-    const doc = await incrementSentAndUpdate(login, "sent");
+    await sendContactEmail({
+      to,
+      subject,
+      body,
+      provider,
+      smtp,
+      fromName: str(req.body?.fromName),
+    });
+    const doc = await incrementSentAndUpdate(login, "sent", ownerIp);
+    await recordActivity(req, "email_sent", `Email sent to ${to} (@${login})`, {
+      contactLogin: login,
+      emailAddress: to,
+      provider,
+    });
 
     res.json({
       ok: true,
@@ -305,6 +498,12 @@ app.post("/api/smtp/test", async (req, res) => {
       req.body?.provider === "outlook" ? "outlook" : "gmail";
     const smtp = normalizeSmtpBody(req.body);
     await verifySmtpLogin(provider, smtp);
+    await recordActivity(
+      req,
+      "smtp_test",
+      `${provider === "outlook" ? "Outlook" : "Gmail"} SMTP test succeeded`,
+      { provider }
+    );
     res.json({
       ok: true,
       provider,
@@ -355,6 +554,7 @@ app.patch("/api/contacts/:login/emails", async (req, res) => {
 
     res.json({ ok: true, contact: toPublic(doc) });
   } catch (err) {
+    if (claimErrorResponse(err, res)) return;
     console.error("PATCH /api/contacts/:login/emails", err);
     res.status(500).json({ error: err.message || "Failed to update emails" });
   }
@@ -374,6 +574,13 @@ app.patch("/api/contacts/:login/outreach", async (req, res) => {
     const doc = await patchOutreach(login, status);
 
     if (!doc) return res.status(404).json({ error: "Contact not found" });
+
+    await recordActivity(
+      req,
+      status === "read" ? "email_read" : "outreach_updated",
+      `Outreach @${login} → ${status}`,
+      { contactLogin: login, emailAddress: doc.email }
+    );
 
     res.json({ ok: true, contact: toPublic(doc) });
   } catch (err) {
@@ -413,10 +620,27 @@ function normalizePayload(raw = {}) {
     githubUrl: str(raw.githubUrl || raw.html_url || `https://github.com/${login}`),
     avatarUrl: str(raw.avatarUrl || raw.avatar),
     website: str(raw.website || raw.blog),
-    emailSource: str(raw.emailSource),
+    emailSource: str(raw.emailSource) || "manual",
     totalContributions: num(raw.totalContributions),
     publicContributions: num(raw.publicContributions),
   };
+}
+
+async function recordActivity(req, action, summary, extra = {}) {
+  const ownerIp = getClientIp(req) || "";
+  if (!ownerIp) return;
+  try {
+    await insertSaemadangEvent({
+      ownerIp,
+      action,
+      summary,
+      detail: extra,
+      contactLogin: extra.contactLogin || "",
+      emailAddress: extra.emailAddress || "",
+    });
+  } catch (err) {
+    console.warn("Saemadang log:", err.message);
+  }
 }
 
 function getClientIp(req) {
@@ -489,7 +713,7 @@ function num(v) {
 }
 
 async function main() {
-  const supabase = await checkSupabase();
+  const { supabase, schema } = await refreshHealthStatus();
   if (!supabase.ok) {
     throw new Error(
       supabase.error ||
@@ -498,10 +722,36 @@ async function main() {
   }
   console.log("Supabase connected:", process.env.SUPABASE_URL);
 
+  if (!schema.ok) {
+    console.warn(
+      "Missing Supabase tables:",
+      schema.missing.join(", "),
+      "— run server/supabase/schema.sql in the SQL Editor"
+    );
+  } else {
+    console.log("Schema OK (contacts, operator_profiles, saemadang_events)");
+  }
+
+  setInterval(() => refreshHealthStatus().catch(() => {}), 60_000);
+
+  try {
+    await ensureAvatarBucket();
+    console.log(`Supabase Storage bucket ready: ${getAvatarBucket()}`);
+  } catch (storageErr) {
+    console.warn(
+      "Storage bucket not ready (photos may fail until fixed):",
+      storageErr.message
+    );
+  }
+
   app.listen(PORT, HOST, () => {
-    console.log(`API (automatic): ${API_URL}`);
+    console.log(`API build ${API_BUILD} (automatic): ${API_URL}`);
+    console.log(`Other PCs:      set Extension API URL to ${API_URL}`);
+    console.log(`Quick test:     ${API_URL}/health/ping`);
     console.log(`Local:          http://localhost:${PORT}`);
     console.log(`Listening on:   ${HOST}:${PORT}`);
+    console.log(`Firewall:       run server\\scripts\\open-firewall.ps1 as Administrator`);
+    console.log(`Saemadang:      GET /api/saemadang`);
   });
 }
 
