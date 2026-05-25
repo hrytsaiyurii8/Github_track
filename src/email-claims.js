@@ -1,5 +1,8 @@
 import {
+  collectClaimableEmails,
   collectEmailsFromContact,
+  isClaimableEmail,
+  loginsMatch,
   normalizeEmail,
 } from "../../lib/email-claims.js";
 import { getSupabase } from "./supabase.js";
@@ -16,7 +19,7 @@ export class ContactClaimError extends Error {
 
 export async function findContactsWithEmail(email) {
   const e = normalizeEmail(email);
-  if (!e) return [];
+  if (!e || !isClaimableEmail(e)) return [];
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from("contacts")
@@ -55,7 +58,7 @@ export async function assertEmailsAvailable(emails, { excludeGithubLogin } = {})
     .toLowerCase();
   const normalized = [
     ...new Set(
-      (emails || []).map(normalizeEmail).filter((e) => e && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e))
+      (emails || []).map(normalizeEmail).filter((e) => isClaimableEmail(e))
     ),
   ];
   if (!normalized.length) return;
@@ -65,7 +68,7 @@ export async function assertEmailsAvailable(emails, { excludeGithubLogin } = {})
     const rows = await findContactsWithEmail(email);
     for (const row of rows) {
       const login = String(row.github_login || "").toLowerCase();
-      if (exclude && login === exclude) continue;
+      if (exclude && loginsMatch(login, exclude)) continue;
       conflicts.push({
         email,
         githubLogin: login,
@@ -99,7 +102,7 @@ export async function assertContactSaveAllowed(body, ownerIp) {
     .trim()
     .toLowerCase();
   await assertLoginAvailable(login, ownerIp);
-  const emails = collectEmailsFromContact(body);
+  const emails = collectClaimableEmails(body);
   if (emails.length) {
     await assertEmailsAvailable(emails, { excludeGithubLogin: login });
   }
@@ -119,7 +122,7 @@ export async function buildContactRegistry() {
     const owner = String(row.owner_ip || "").trim();
     if (login && owner) loginOwners[login] = owner;
 
-    for (const email of collectEmailsFromContact({
+    for (const email of collectClaimableEmails({
       email: row.email,
       all_emails: row.all_emails,
     })) {
